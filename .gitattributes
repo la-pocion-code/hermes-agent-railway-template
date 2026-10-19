@@ -1,0 +1,5 @@
+# This repository builds a Linux image and is edited from Windows. CRLF in the
+# entrypoint would make the container fail to start, so pin the endings.
+* text=auto eol=lf
+*.png binary
+*.svg binary

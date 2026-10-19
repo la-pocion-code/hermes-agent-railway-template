@@ -2,16 +2,30 @@
 
 ## Architecture
 
-Python/Starlette web server that wraps Hermes Agent's gateway as a managed subprocess.
+There is no application code here. This repository is a thin Railway wrapper
+around the official `nousresearch/hermes-agent` image.
 
-- `server.py` — Main server: HTTP handlers, gateway process manager, basic auth, .env file management
-- `templates/index.html` — Single-page UI with Tailwind CSS + Alpine.js
-- Config is stored as a flat `.env` file at `/data/.hermes/.env` (Hermes uses python-dotenv)
-- Gateway is spawned via `hermes gateway` command with env vars from the .env file
+- `Dockerfile` — pins the official image by `tag@sha256:digest`, sets the
+  `HERMES_*` environment, and installs the compatibility entrypoint
+- `docker-entrypoint.sh` — maps the template's legacy `ADMIN_USERNAME` /
+  `ADMIN_PASSWORD` variables onto the official `HERMES_DASHBOARD_BASIC_AUTH_*`
+  ones, derives a stable session-signing secret, then execs the image's own
+  `/opt/hermes/docker/entrypoint-dispatch.sh`. s6-overlay supervises the gateway
+  and dashboard from there
+- `railway.toml` — Railway build and deploy settings (Dockerfile builder, start
+  command, `/api/status` health check)
+- `scripts/resolve_hermes_release.py` — resolves which Hermes release to pin
+- `.github/workflows/actualizar-hermes.yml` — runs that resolver on a schedule
 
-## Key patterns
+## Key points
 
-- Gateway lifecycle: start/stop/restart via async subprocess, stdout captured to ring buffer
-- Secret masking: password fields show first 8 chars + `***`, merge on save preserves masked values
-- No direct Hermes Python imports — the server manages the .env file independently
-- Auto-start: gateway starts on server boot if any provider API key is configured
+- Hermes state lives in the `/data` volume (`HERMES_HOME=/data/.hermes`), not in
+  this repository. Providers, channels, models, skills and profiles are all
+  configured through the dashboard
+- Never pin `latest` or `stable` in the `Dockerfile` — always a concrete
+  `vX.Y.Z` tag plus its digest. The resolver enforces this
+- The version pin appears in both `Dockerfile` and `README.md`; change it with
+  `scripts/resolve_hermes_release.py --write`, not by hand
+- The entrypoint depends on `/opt/hermes/docker/entrypoint-dispatch.sh` existing
+  inside the upstream image. If Nous ever moves it, the container stops booting
+  and the workflow's smoke test is what catches it

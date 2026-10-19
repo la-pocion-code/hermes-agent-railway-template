@@ -1,0 +1,148 @@
+name: Actualizar Hermes Agent
+
+# Sigue el canal `stable` de nousresearch/hermes-agent y, cuando Nous publica
+# una version nueva, reescribe el pin del Dockerfile y lo sube a main.
+# Railway esta conectado a este repositorio, asi que el push dispara el deploy.
+#
+# El build y el arranque del contenedor se prueban ANTES de hacer commit: si la
+# imagen nueva no levanta, el job falla y produccion se queda donde esta.
+
+on:
+  schedule:
+    # 13:00 UTC = 08:00 Colombia, de lunes a viernes: si un deploy sale mal,
+    # hay alguien despierto para revertirlo.
+    - cron: "0 13 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      pin:
+        description: "Fijar una version concreta (p. ej. v0.22.1) en vez de seguir stable"
+        required: false
+        type: string
+      dry_run:
+        description: "Resolver y probar la imagen, pero no hacer commit"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: actualizar-hermes
+  cancel-in-progress: false
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+
+      - name: Resolver la ultima version de Hermes
+        id: resolver
+        env:
+          # Via env, nunca interpolado en la linea de comandos.
+          PIN: ${{ inputs.pin }}
+        run: |
+          set -euo pipefail
+          if [ -n "${PIN:-}" ]; then
+            python scripts/resolve_hermes_release.py --write --pin "$PIN"
+          else
+            python scripts/resolve_hermes_release.py --write
+          fi
+
+      - name: Sin novedades
+        if: steps.resolver.outputs.changed != 'true'
+        run: |
+          echo "Ya estamos en ${{ steps.resolver.outputs.current_tag }}; no hay nada que actualizar." \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Construir la imagen candidata
+        if: steps.resolver.outputs.changed == 'true'
+        run: docker build --tag hermes-candidato:ci .
+
+      - name: Comprobar que el contenedor levanta
+        if: steps.resolver.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          password="$(openssl rand -hex 16)"
+          docker run --detach --name hermes-humo \
+            --env PORT=8080 \
+            --env ADMIN_USERNAME=humo \
+            --env ADMIN_PASSWORD="$password" \
+            --volume hermes-humo-datos:/data \
+            --publish 8080:8080 \
+            hermes-candidato:ci
+
+          echo "Esperando a que /api/status responda..."
+          for intento in $(seq 1 60); do
+            if curl --fail --silent --show-error --max-time 5 \
+                 --user "humo:$password" http://127.0.0.1:8080/api/status > /tmp/status.json; then
+              echo "El gateway respondio al intento $intento:"
+              cat /tmp/status.json
+              exit 0
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' hermes-humo)" != "true" ]; then
+              echo "::error::El contenedor se murio durante el arranque."
+              break
+            fi
+            sleep 5
+          done
+
+          echo "::error::${{ steps.resolver.outputs.tag }} no respondio en /api/status tras 5 minutos."
+          docker logs --tail 200 hermes-humo || true
+          exit 1
+
+      - name: Recoger el contenedor de prueba
+        if: always() && steps.resolver.outputs.changed == 'true'
+        run: |
+          docker rm --force hermes-humo 2>/dev/null || true
+          docker volume rm --force hermes-humo-datos 2>/dev/null || true
+
+      - name: Subir la actualizacion
+        if: steps.resolver.outputs.changed == 'true' && !inputs.dry_run
+        env:
+          FILES: ${{ steps.resolver.outputs.files }}
+          TAG: ${{ steps.resolver.outputs.tag }}
+          DIGEST: ${{ steps.resolver.outputs.digest }}
+          ANTES: ${{ steps.resolver.outputs.current_tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- $FILES
+          cat > /tmp/mensaje.txt <<EOF
+          Actualizar Hermes Agent a $TAG
+
+          Antes: $ANTES
+          Ahora: $TAG
+          Imagen: nousresearch/hermes-agent:$TAG@$DIGEST
+
+          Notas: https://github.com/NousResearch/hermes-agent/releases/tag/$TAG
+
+          Verificado en CI: la imagen construye y el gateway responde en /api/status.
+          EOF
+          git commit --file /tmp/mensaje.txt
+          git push
+
+      - name: Resumen
+        if: steps.resolver.outputs.changed == 'true'
+        run: |
+          {
+            if [ "${{ inputs.dry_run }}" = "true" ]; then
+              echo "### Ensayo: ${{ steps.resolver.outputs.tag }} disponible (sin commit)"
+            else
+              echo "### Hermes Agent actualizado a ${{ steps.resolver.outputs.tag }}"
+            fi
+            echo
+            echo "| | Version | Digest |"
+            echo "|---|---|---|"
+            echo "| Antes | \`${{ steps.resolver.outputs.current_tag }}\` | \`${{ steps.resolver.outputs.current_digest }}\` |"
+            echo "| Ahora | \`${{ steps.resolver.outputs.tag }}\` | \`${{ steps.resolver.outputs.digest }}\` |"
+            echo
+            echo "La imagen construye y el gateway responde en \`/api/status\`."
+            echo
+            echo "[Notas de la version](https://github.com/NousResearch/hermes-agent/releases/tag/${{ steps.resolver.outputs.tag }})"
+          } >> "$GITHUB_STEP_SUMMARY"

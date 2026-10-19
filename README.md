@@ -9,10 +9,10 @@ Deploy [Hermes Agent](https://github.com/NousResearch/hermes-agent) on Railway u
 The Dockerfile is pinned to this official image:
 
 ```text
-nousresearch/hermes-agent:v2026.8.3@sha256:16788311e2fa3035456bdc1bafb8ec2b1777db64ebf020af9bb7eb73c3712c9e
+nousresearch/hermes-agent:v0.22.2@sha256:36099926da316742423544e055d4734777105ffe6341873af5459b957d0c2919
 ```
 
-`v2026.8.3` is Hermes Agent v0.20.0, "The Herald Release." The compatibility entrypoint delegates to this release's upstream entrypoint dispatcher so both normal PID-1 startup and Railway runtimes with an init wrapper are supported.
+That pin is written by automation — see [Upgrading Hermes](#upgrading-hermes). The compatibility entrypoint delegates to the release's upstream entrypoint dispatcher so both normal PID-1 startup and Railway runtimes with an init wrapper are supported.
 
 Use these service settings:
 
@@ -55,6 +55,64 @@ Provider credentials, messaging channels, models, skills, profiles, and gateway 
 
 ## Upgrading Hermes
 
-Update the pinned release and digest in `Dockerfile` deliberately after reviewing the upstream [release notes](https://github.com/NousResearch/hermes-agent/releases) and validating the new image. Do not use `latest`. Because the template remains GitHub-backed, merging an upgrade to the default branch notifies existing template consumers.
+This fork keeps itself on the latest Hermes release. The
+[`Actualizar Hermes Agent`](.github/workflows/actualizar-hermes.yml) workflow runs
+weekdays at 13:00 UTC (08:00 Colombia) and:
+
+1. Reads the `stable` tag of `nousresearch/hermes-agent` on Docker Hub and walks
+   its digest back to the matching `vX.Y.Z` tag. Release candidates and the
+   `-desktop` image variants can never be selected, and `latest` is never used
+   as a pin.
+2. Rewrites the pin in `Dockerfile` and in this README to `tag@sha256:digest`,
+   so the deployed image stays immutable.
+3. **Builds the image and starts the container**, waiting for the gateway to
+   answer on `/api/status`. If it does not come up, the job fails and nothing is
+   committed — production stays on the version it is already running.
+4. Commits to `main`, which Railway picks up and deploys.
+
+So a Hermes release reaches production only after the image has been proven to
+build and boot.
+
+### Running it by hand
+
+From the repository's **Actions** tab, `Run workflow` takes two options:
+
+| Option | Use |
+|---|---|
+| `pin` | Pin a specific release, e.g. `v0.22.1`, instead of following `stable`. This is how you roll back. |
+| `dry_run` | Resolve and test the image but commit nothing. |
+
+The same resolver runs locally:
+
+```bash
+python scripts/resolve_hermes_release.py --current   # what is live vs. what is available
+python scripts/resolve_hermes_release.py --write     # rewrite the pin
+```
+
+### Rolling back
+
+Pin the previous release and let the normal flow deploy it:
+
+```bash
+python scripts/resolve_hermes_release.py --write --pin v0.22.1
+git commit -am "Roll back Hermes Agent to v0.22.1" && git push
+```
+
+Rolling back the image does **not** roll back the data in the `/data` volume.
+Hermes migrates its state on upgrade, so test a downgrade before relying on it.
+
+### Keeping the schedule alive
+
+GitHub disables scheduled workflows in a repository with no activity for 60
+days. The update commits themselves count as activity, so this only matters if
+Hermes goes two months without a release — if it does, run the workflow by hand
+once to re-arm the schedule.
 
 See the official [Hermes Docker documentation](https://hermes-agent.nousresearch.com/docs/user-guide/docker) for image behavior and configuration details.
+
+## Relationship to the upstream template
+
+This is a fork of [`arjunkomath/hermes-agent-railway-template`](https://github.com/arjunkomath/hermes-agent-railway-template),
+which pins releases by hand and can lag months behind Hermes. The automation
+above is the reason the fork exists; everything else is kept close to upstream
+so their fixes can still be merged in with `gh repo sync` or a pull request.
